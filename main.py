@@ -1,6 +1,7 @@
 import os
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+import requests
 
 app = FastAPI()
 
@@ -58,11 +59,132 @@ def test_database():
         response["database"] = f"❌ Error: {str(e)[:50]}"
     
     # Check environment variables
-    import os
     response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
     response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
     
     return response
+
+
+LEETCODE_GRAPHQL_URL = "https://leetcode.com/graphql"
+
+# GraphQL query to fetch user profile, stats, badges, and contest ranking
+LEETCODE_QUERY = {
+    "query": """
+    query getUserProfile($username: String!) {
+      matchedUser(username: $username) {
+        username
+        profile {
+          ranking
+          reputation
+          starRating
+          aboutMe
+          userAvatar
+          realName
+          school
+          company
+          jobTitle
+          countryName
+          websites
+          skillTags
+        }
+        badges {
+          id
+          name
+          icon
+        }
+        submitStatsGlobal {
+          acSubmissionNum { difficulty count submissions }
+          totalSubmissionNum { difficulty count submissions }
+        }
+      }
+      userContestRanking(username: $username) {
+        rating
+        ranking
+        attendedContestsCount
+        globalRanking
+        totalParticipants
+        topPercentage
+      }
+    }
+    """,
+    "variables": {"username": ""}
+}
+
+
+def fetch_leetcode_user(username: str) -> dict:
+    payload = LEETCODE_QUERY.copy()
+    payload["variables"] = {"username": username}
+
+    try:
+        r = requests.post(LEETCODE_GRAPHQL_URL, json=payload, timeout=12)
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Failed to reach LeetCode: {str(e)}")
+
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"LeetCode API error: HTTP {r.status_code}")
+
+    data = r.json()
+    if "errors" in data and data["errors"]:
+        raise HTTPException(status_code=404, detail="User not found or LeetCode error")
+
+    matched = data.get("data", {}).get("matchedUser")
+    if not matched:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    contest = data.get("data", {}).get("userContestRanking")
+
+    # Shape a friendly response
+    profile = matched.get("profile", {})
+
+    # Build stats by difficulty
+    ac_list = matched.get("submitStatsGlobal", {}).get("acSubmissionNum", [])
+    total_list = matched.get("submitStatsGlobal", {}).get("totalSubmissionNum", [])
+
+    def by_diff(lst):
+        return {item.get("difficulty", "All"): item for item in lst}
+
+    ac_map = by_diff(ac_list)
+    total_map = by_diff(total_list)
+
+    stats = {}
+    for diff in ["All", "Easy", "Medium", "Hard"]:
+        ac = ac_map.get(diff, {}).get("count", 0)
+        tot = total_map.get(diff, {}).get("count", 0)
+        submissions = total_map.get(diff, {}).get("submissions", 0)
+        acceptance = round((ac / tot * 100), 2) if tot else 0.0
+        stats[diff.lower()] = {
+            "solved": ac,
+            "total": tot,
+            "acceptanceRate": acceptance,
+            "submissions": submissions,
+        }
+
+    result = {
+        "username": matched.get("username"),
+        "name": profile.get("realName") or matched.get("username"),
+        "avatar": profile.get("userAvatar"),
+        "ranking": profile.get("ranking"),
+        "reputation": profile.get("reputation"),
+        "starRating": profile.get("starRating"),
+        "about": profile.get("aboutMe"),
+        "company": profile.get("company"),
+        "jobTitle": profile.get("jobTitle"),
+        "school": profile.get("school"),
+        "country": profile.get("countryName"),
+        "websites": profile.get("websites") or [],
+        "skills": profile.get("skillTags") or [],
+        "badges": matched.get("badges") or [],
+        "stats": stats,
+        "contest": contest or None,
+    }
+
+    return result
+
+
+@app.get("/api/leetcode/{username}")
+def get_leetcode_user(username: str):
+    """Fetch public LeetCode information for a username"""
+    return fetch_leetcode_user(username)
 
 
 if __name__ == "__main__":
